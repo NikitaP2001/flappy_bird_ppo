@@ -13,7 +13,7 @@ class PPOTrainer:
                  learning_rate=0.0003,
                  gamma=0.99,
                  epsilon=0.2,
-                 value_coef=0.5,
+                 value_coef=0.25,
                  entropy_coef=0.01):
         self.initial_lr = learning_rate
         self.min_lr = 1e-5
@@ -24,6 +24,7 @@ class PPOTrainer:
         print('Torch device:', self.device)
         self.model = PPOModel().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.995)
         self.writer = SummaryWriter('runs/flappy_bird_ppo')
         
         self.gamma = gamma
@@ -31,80 +32,120 @@ class PPOTrainer:
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.steps = 0  # Added: initialize steps counter
+    
+    def compute_gae(self, rewards, values, dones, gamma=0.99, gae_lambda=0.95):
+        """Compute Generalized Advantage Estimation"""
+        advantages = torch.zeros_like(torch.FloatTensor(rewards)).to(self.device)
+        returns = torch.zeros_like(torch.FloatTensor(rewards)).to(self.device)
+        
+        last_gae = 0
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0  # Terminal state
+            else:
+                next_value = values[t + 1]
+                
+            delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+            last_gae = delta + gamma * gae_lambda * (1 - dones[t]) * last_gae
+            advantages[t] = last_gae
+            returns[t] = advantages[t] + values[t]
+        
+        return returns, advantages
         
     def update_model(self, trajectories):
-        # Combine all trajectories
-        states = []
-        actions = []
-        rewards = []
-        values = []
-        log_probs = []
-
-        self.replay_buffer.extend(trajectories)
-        if len(self.replay_buffer) > self.buffer_size:
-            self.replay_buffer = self.replay_buffer[-self.buffer_size:]
-            
-        # Sample from buffer
-        sample_size = min(len(self.replay_buffer), 32)
-        trajectories = random.sample(self.replay_buffer, sample_size)
+        """PPO update using multiple trajectories"""
+        # Process trajectories
+        states, actions, rewards, values, log_probs, dones = [], [], [], [], [], []
         
+        # Combine trajectories
         for trajectory in trajectories:
             states.extend(trajectory[0])
             actions.extend(trajectory[1])
             rewards.extend(trajectory[2])
-            values.extend(trajectory[3])
-            log_probs.extend(trajectory[4])
+            values.extend([v.item() for v in trajectory[3]])
+            log_probs.extend([lp.item() for lp in trajectory[4]])
+            dones.extend([False] * (len(trajectory[0])-1) + [True])
         
         # Convert to tensors
         states = torch.FloatTensor(np.array(states)).to(self.device)
         actions = torch.LongTensor(actions).to(self.device)
-        old_log_probs = torch.stack(log_probs).to(self.device)
-        old_values = torch.stack(values).to(self.device)  # Changed: stack instead of cat
+        old_values = torch.FloatTensor(values).to(self.device)
+        old_log_probs = torch.FloatTensor(log_probs).to(self.device)
         
-        # Calculate returns and advantages
-        returns = self._compute_returns(rewards)
-        advantages = returns - old_values.detach()
+        # Compute returns and advantages
+        returns, advantages = self.compute_gae(rewards, values, dones)
+        
+        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        # PPO update
-        for epoch in range(5):  # Multiple epochs
-            action_probs, values = self.model(states)
-            dist = Categorical(action_probs)
-            new_log_probs = dist.log_prob(actions)
-
-            if torch.any(torch.isnan(action_probs)):
-                print(f"Warning: NaN in action probabilities at epoch {epoch}")
-                continue
-            if not torch.allclose(action_probs.sum(dim=1), torch.ones_like(action_probs.sum(dim=1))):
-                print(f"Warning: Action probabilities don't sum to 1 at epoch {epoch}")
-                action_probs = F.softmax(action_probs, dim=1)
+        # PPO update for multiple epochs
+        for epoch in range(5):
+            # Create mini-batches
+            batch_size = 64
+            indices = np.random.permutation(len(states))
             
-            # Calculate ratio and clipped ratio
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            clipped_ratio = torch.clamp(ratio, 1-self.epsilon, 1+self.epsilon)
-            if torch.any(ratio > 20) or torch.any(ratio < 0.05):
-                print(f"Warning: Large policy update ratios detected: min={ratio.min()}, max={ratio.max()}")
+            for start_idx in range(0, len(states), batch_size):
+                end_idx = start_idx + batch_size
+                batch_indices = indices[start_idx:end_idx]
+                
+                state_batch = states[batch_indices]
+                action_batch = actions[batch_indices]
+                advantage_batch = advantages[batch_indices]
+                return_batch = returns[batch_indices]
+                old_value_batch = old_values[batch_indices]
+                old_log_prob_batch = old_log_probs[batch_indices]
+                
+                # Get current policy and value predictions
+                action_probs, values = self.model(state_batch)
+                dist = Categorical(action_probs)
+                new_log_probs = dist.log_prob(action_batch)
+                entropy = dist.entropy().mean()
+                
+                # Policy loss
+                ratio = torch.exp(new_log_probs - old_log_prob_batch)
+                surrogate1 = ratio * advantage_batch
+                surrogate2 = torch.clamp(ratio, 1-self.epsilon, 1+self.epsilon) * advantage_batch
+                policy_loss = -torch.min(surrogate1, surrogate2).mean()
+                
+                # Value loss
+                value_pred_clipped = old_value_batch + torch.clamp(
+                    values.squeeze() - old_value_batch,
+                    -self.epsilon,
+                    self.epsilon
+                )
+                value_loss = torch.mean(torch.max(
+                    (values.squeeze() - return_batch) ** 2,
+                    (value_pred_clipped - return_batch) ** 2
+                ))
+                
+                # Total loss
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                
+                # Update network
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                self.optimizer.step()
+                
+                # Log metrics
+                self.writer.add_scalar('Loss/total', loss.item(), self.steps)
+                self.writer.add_scalar('Loss/policy', policy_loss.item(), self.steps)
+                self.writer.add_scalar('Loss/value', value_loss.item(), self.steps)
+                self.writer.add_scalar('Loss/entropy', entropy.item(), self.steps)
+                
+                '''
+                print(f"Step {self.steps}:")
+                print(f"  Total Loss: {loss.item():.4f}")
+                print(f"  Policy Loss: {policy_loss.item():.4f}")
+                print(f"  Value Loss: {value_loss.item():.4f}")
+                print(f"  Entropy: {entropy.item():.4f}")
+                print(f"  Ratio Mean: {ratio.mean().item():.4f}")
+                print(f"  Ratio Std: {ratio.std().item():.4f}")
+                '''
+                
+                self.steps += 1
             
-            # Calculate losses
-            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-            value_loss = ((values - returns) ** 2).mean()
-            entropy = dist.entropy().mean()
-            
-            # Total loss
-            loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
-            
-            # Update model
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
-            # Log metrics
-            self.writer.add_scalar('Loss/policy', policy_loss.item(), self.steps)
-            self.writer.add_scalar('Loss/value', value_loss.item(), self.steps)
-            self.writer.add_scalar('Loss/entropy', entropy.item(), self.steps)
-            print(f"Loss at epoch {epoch}: {loss.item()}")
-            
-            self.steps += 1
+            self.scheduler.step()
 
     def _compute_returns(self, rewards):
         returns = []
@@ -125,7 +166,7 @@ class PPOTrainer:
 
 def run_episode(model_state_dict):
     pygame.init()
-    headless = True    
+    headless = False    
     try:
         env = FlappyBirdEnv(headless=headless)
         device = torch.device("cpu")
@@ -135,7 +176,7 @@ def run_episode(model_state_dict):
         if model_state_dict is not None:
             model.load_state_dict(model_state_dict)
         
-        states, actions, rewards, values, log_probs = [], [], [], [], []
+        states, actions, rewards, values, log_probs, dones = [], [], [], [], [], []
         state = env.reset()
         total_reward = 0
         temperature = 1.0 
@@ -162,6 +203,7 @@ def run_episode(model_state_dict):
             rewards.append(reward)
             values.append(value.squeeze(0))
             log_probs.append(log_prob)
+            dones.append(done)
             
             total_reward += reward
             state = next_state
@@ -170,7 +212,7 @@ def run_episode(model_state_dict):
                 break
         
         pygame.quit()
-        return states, actions, rewards, values, log_probs, total_reward
+        return states, actions, rewards, values, log_probs, dones, total_reward
         
     except Exception as e:
         print(f"Error in run_episode: {str(e)}")
@@ -178,7 +220,7 @@ def run_episode(model_state_dict):
         return None
 
 def validate_trajectory(trajectory):
-    states, actions, rewards, values, log_probs, total_reward = trajectory
+    states, actions, rewards, values, log_probs, dones, total_reward = trajectory
     
     # Check length consistency
     lengths = [len(states), len(actions), len(rewards), len(values), len(log_probs)]
@@ -218,8 +260,8 @@ def train_parallel(num_processes=20, episodes=1000, load_episode=0):
                     
                     if episode % 10 == 0:
                         print('Run trajectories', len(trajectories))
-                        avg_reward = np.mean([t[5] for t in pvalid_trajectories])
-                        max_reward = max([t[5] for t in pvalid_trajectories])
+                        avg_reward = np.mean([t[6] for t in pvalid_trajectories])
+                        max_reward = max([t[6] for t in pvalid_trajectories])
                         print(f"Episode {episode}, Avg Reward: {avg_reward:.2f}, Max Reward: {max_reward:.2f}")
 
                         trainer.model.save(f'models/ppo_model_{episode}.pt')

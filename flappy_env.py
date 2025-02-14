@@ -133,5 +133,6 @@ class FlappyBirdEnv:
                 bird_vertical_distance = abs(self.bird.rect[1] - pipe_center)
                 gap_reward = 0.3 * (1 - bird_vertical_distance/SCREEN_HEIGHT)
                 reward += gap_reward
+        reward = reward / 10
 
         return self.get_state(), reward, done, {"score": self.score}

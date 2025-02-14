@@ -50,6 +50,19 @@ class PPOModel(nn.Module):
         
         # Layer normalization for stability
         self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.best_reward = float('-inf')
+        self.patience = 10
+        self.patience_counter = 0
+        self.min_improvement = 0.1
+
+    def should_stop(self, avg_reward):
+        if avg_reward > self.best_reward + self.min_improvement:
+            self.best_reward = avg_reward
+            self.patience_counter = 0
+            return False
+        
+        self.patience_counter += 1
+        return self.patience_counter >= self.patience
         
     def forward(self, state):
         # Initial feature extraction
